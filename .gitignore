@@ -5,3 +5,4 @@ __pycache__/
 data/databases/*.db
 models/**/*.pkl
 models/**/*.json.pytest_cache/
+data/cache/*.parquet
