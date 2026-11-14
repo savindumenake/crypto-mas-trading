@@ -4,4 +4,4 @@ __pycache__/
 .env
 data/databases/*.db
 models/**/*.pkl
-models/**/*.json
+models/**/*.json.pytest_cache/
