@@ -1,0 +1,94 @@
+# =====================================================================
+# MULTI-ASSET & MULTI-HORIZON CONFIGURATION
+# =====================================================================
+
+system:
+  project_name: "Crypto-MAS-Trading"
+  version: "1.0.0"
+  mode: "paper_trading" # Options: backtest, paper_trading, live
+  default_exchange: "binance"
+  redis_host: "localhost"
+  redis_port: 6379
+
+# --- Segregated Databases (Scalp, Intraday, Swing) ---
+databases:
+  scalp: "data/databases/scalp_trading.db"
+  intraday: "data/databases/intraday_trading.db"
+  swing: "data/databases/swing_trading.db"
+
+# --- Trading Horizons & Timeframe Mapping ---
+horizons:
+  scalp:
+    execution_timeframes: ["1m", "5m"]
+    trend_filter_timeframe: "15m"
+    debate_rounds: 0              # Fast execution (ML + Memory only)
+    memory_top_k: 15
+    default_sl_atr_mult: 1.5
+    default_tp1_atr_mult: 2.0
+    default_tp2_atr_mult: 3.5
+
+  intraday:
+    execution_timeframes: ["15m", "1h"]
+    trend_filter_timeframe: "4h"
+    debate_rounds: 1              # 1-Round Bull vs Bear JSON Debate
+    memory_top_k: 15
+    default_sl_atr_mult: 1.8
+    default_tp1_atr_mult: 2.5
+    default_tp2_atr_mult: 4.5
+
+  swing:
+    execution_timeframes: ["4h", "1d"]
+    trend_filter_timeframe: "1w"
+    debate_rounds: 2              # Deep Bull vs Bear + Fundamental Debate
+    memory_top_k: 15
+    default_sl_atr_mult: 2.2
+    default_tp1_atr_mult: 3.5
+    default_tp2_atr_mult: 6.0
+
+# --- 100-Point Weighted Confluence & Risk Settings ---
+confluence_and_risk:
+  weights:
+    ml_and_shap: 45               # 45 points max
+    pattern_and_breakout: 25      # 25 points max
+    historical_memory: 15         # 15 points max
+    fundamental_and_debate: 15    # 15 points max
+  thresholds:
+    tier_a_min_score: 80          # >= 80: Full risk (1.0x)
+    tier_b_min_score: 65          # 65 - 79: Half risk (0.5x)
+    min_historical_win_rate: 0.40 # Reject if past K similar trades < 40% win rate
+  risk_per_trade:
+    tier_a_risk_pct: 1.0          # 1.0% of account balance
+    tier_b_risk_pct: 0.5          # 0.5% of account balance
+    max_correlated_exposure_pct: 3.0
+
+# --- Plug-and-Play Asset Registry ---
+assets:
+  BTCUSDT:
+    status: "active"              # Active in v1.0
+    category: "layer1_macro"
+    tick_size: 0.1
+    min_order_qty: 0.001
+    volatility_profile: "medium_high"
+    model_registry_path: "models/BTCUSDT/"
+    correlation_leader: null      # Market Leader
+    news_keywords: ["Bitcoin", "BTC", "Spot ETF", "BlackRock", "FOMC", "CPI", "Halving"]
+
+  ETHUSDT:
+    status: "planned_v2"          # Switch to "active" in v2.0
+    category: "smart_contract_leader"
+    tick_size: 0.01
+    min_order_qty: 0.01
+    volatility_profile: "high"
+    model_registry_path: "models/ETHUSDT/"
+    correlation_leader: "BTCUSDT"
+    news_keywords: ["Ethereum", "ETH", "Vitalik", "ETH ETF", "Layer 2", "DeFi"]
+
+  SOLUSDT:
+    status: "planned_v2"          # Switch to "active" in v2.0
+    category: "high_beta_alt"
+    tick_size: 0.001
+    min_order_qty: 0.1
+    volatility_profile: "extreme"
+    model_registry_path: "models/SOLUSDT/"
+    correlation_leader: "BTCUSDT"
+    news_keywords: ["Solana", "SOL", "Solana DEX", "Firedancer"]
