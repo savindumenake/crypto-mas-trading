@@ -21,8 +21,9 @@ class MultiTimeframeDataFetcher:
     """
     Automated Multi-Timeframe Data Engine with:
     1. Local Parquet Delta-Caching (fetches only missing candles after initial load).
-    2. In-Memory Rolling Window Store (instant 0ms DataFrame access for agents).
-    3. Boundary-Aligned Real-Time Auto-Streamer (triggers immediately on 1m, 5m, 15m, 1h, 4h, 1d candle close).
+    2. Bulk Historical Pagination (downloads 10k-65k+ candles for deep ML training).
+    3. In-Memory Rolling Window Store (instant 0ms DataFrame access for agents).
+    4. Boundary-Aligned Real-Time Auto-Streamer (triggers immediately on candle close).
     """
 
     TIMEFRAME_SECONDS: Dict[str, int] = {
@@ -102,7 +103,6 @@ class MultiTimeframeDataFetcher:
         cached_df = pd.DataFrame()
         since_ms: Optional[int] = None
 
-        # Step A: Check in-memory store first, otherwise load from Parquet disk cache
         if symbol in self.memory_store and timeframe in self.memory_store[symbol]:
             cached_df = self.memory_store[symbol][timeframe]
         elif cache_file.exists():
@@ -111,13 +111,10 @@ class MultiTimeframeDataFetcher:
             except Exception:
                 cached_df = pd.DataFrame()
 
-        # Step B: Determine 'since' timestamp to fetch ONLY new missing candles
         if not cached_df.empty:
             last_ts = cached_df["timestamp"].iloc[-1]
-            # Fetch starting from the last known closed candle timestamp
             since_ms = int(last_ts.timestamp() * 1000)
 
-        # Step C: Fetch either delta candles (since_ms) or initial_limit candles
         for attempt in range(1, max_retries + 1):
             try:
                 if since_ms is not None:
@@ -142,10 +139,8 @@ class MultiTimeframeDataFetcher:
             for col in ["open", "high", "low", "close", "volume"]:
                 new_df[col] = new_df[col].astype("float64")
 
-            # Drop the currently forming (unclosed) candle by comparing with current UTC time
             now_utc = pd.Timestamp.now(tz="UTC")
             tf_sec = self.TIMEFRAME_SECONDS.get(timeframe, 60)
-            # A candle is closed only if (candle_open_time + timeframe_duration) <= current_time
             new_df = new_df[
                 (new_df["timestamp"] + pd.Timedelta(seconds=tf_sec)) <= now_utc
             ]
@@ -158,13 +153,13 @@ class MultiTimeframeDataFetcher:
                 combined_df = cached_df
 
             if not combined_df.empty:
+                keep_limit = max(self.max_memory_candles, len(cached_df))
                 combined_df = (
                     combined_df.drop_duplicates(subset=["timestamp"], keep="last")
                     .sort_values("timestamp")
-                    .tail(self.max_memory_candles)
+                    .tail(keep_limit)
                     .reset_index(drop=True)
                 )
-                # Update both In-Memory store and Parquet file
                 self.memory_store.setdefault(symbol, {})[timeframe] = combined_df
                 combined_df.to_parquet(cache_file, index=False)
                 return combined_df
@@ -190,18 +185,88 @@ class MultiTimeframeDataFetcher:
         return dict(zip(unique_tfs, results))
 
     # -----------------------------------------------------------------
+    # 1B. BULK HISTORICAL PAGINATION (FOR DEEP ML TRAINING: 10K - 65K CANDLES)
+    # -----------------------------------------------------------------
+    async def fetch_historical_bulk(
+        self,
+        symbol: str,
+        timeframe: str,
+        total_candles: int = 15000,
+        batch_size: int = 1000,
+    ) -> pd.DataFrame:
+        """
+        Paginates forward in batches of 1000 candles to download large historical
+        datasets (e.g., 25,000 5m candles, 18,000 1h candles, 10,000 4h candles)
+        and saves them into the local Parquet cache.
+        """
+        await self.initialize_exchange()
+        ccxt_symbol = self._normalize_symbol(symbol)
+        cache_file = self._get_cache_file(symbol, timeframe)
+        tf_sec = self.TIMEFRAME_SECONDS.get(timeframe, 60)
+
+        if cache_file.exists():
+            try:
+                existing_df = pd.read_parquet(cache_file)
+                if len(existing_df) >= int(total_candles * 0.95):
+                    return await self.sync_timeframe_with_cache(symbol, timeframe)
+            except Exception:
+                pass
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = now_ms - (total_candles * tf_sec * 1000)
+        current_since = start_ms
+        all_batches: List[pd.DataFrame] = []
+
+        print(f"   [Bulk Download] Fetching ~{total_candles} historical '{timeframe}' candles for {symbol}...")
+
+        while current_since < now_ms:
+            raw_ohlcv = await self.exchange.fetch_ohlcv(
+                ccxt_symbol, timeframe=timeframe, since=current_since, limit=batch_size
+            )
+            if not raw_ohlcv:
+                break
+
+            batch_df = pd.DataFrame(
+                raw_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+            all_batches.append(batch_df)
+
+            last_fetched_ms = int(raw_ohlcv[-1][0])
+            next_since = last_fetched_ms + (tf_sec * 1000)
+            if next_since <= current_since or len(raw_ohlcv) < (batch_size // 2):
+                break
+            current_since = next_since
+
+        if not all_batches:
+            return pd.DataFrame()
+
+        full_df = pd.concat(all_batches, ignore_index=True)
+        full_df["timestamp"] = pd.to_datetime(full_df["timestamp"], unit="ms", utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            full_df[col] = full_df[col].astype("float64")
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        full_df = full_df[(full_df["timestamp"] + pd.Timedelta(seconds=tf_sec)) <= now_utc]
+
+        full_df = (
+            full_df.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .tail(total_candles)
+            .reset_index(drop=True)
+        )
+
+        self.memory_store.setdefault(symbol, {})[timeframe] = full_df
+        full_df.to_parquet(cache_file, index=False)
+        return full_df
+
+    # -----------------------------------------------------------------
     # 2. AUTOMATED REAL-TIME CANDLE-CLOSE STREAMER (ZERO MANUAL WORK)
     # -----------------------------------------------------------------
     @classmethod
     def get_closed_timeframes_at_timestamp(
         cls, unix_ts: int, watched_timeframes: List[str]
     ) -> List[str]:
-        """
-        Determines which timeframes just closed at the exact minute boundary.
-        Example: At 12:15:00 -> ['1m', '5m', '15m'] all closed simultaneously!
-        """
         closed_tfs = []
-        # Round down to the nearest minute boundary
         minute_boundary = (unix_ts // 60) * 60
         for tf in watched_timeframes:
             tf_sec = cls.TIMEFRAME_SECONDS.get(tf)
@@ -215,15 +280,9 @@ class MultiTimeframeDataFetcher:
         on_candle_close: Optional[CandleCloseCallback] = None,
         max_cycles: Optional[int] = None,
     ) -> None:
-        """
-        Runs continuously in the background. Wakes up 150ms after every minute boundary,
-        identifies which timeframes (1m, 5m, 15m, 1h, 4h, 1d) just closed, delta-syncs
-        only those candles, and immediately triggers the agent callback for live execution.
-        """
         if symbols is None:
             symbols = list(self.config_loader.get_active_assets().keys())
 
-        # Step 1: Initial Warm-Up for all active symbols
         for sym in symbols:
             await self.warm_up_all_timeframes(sym)
 
@@ -233,7 +292,6 @@ class MultiTimeframeDataFetcher:
 
         while self._streaming_active:
             now = datetime.now(timezone.utc).timestamp()
-            # Calculate exact sleep time until the next minute boundary + 0.15s buffer
             next_minute_boundary = ((int(now) // 60) + 1) * 60
             sleep_duration = max(0.05, (next_minute_boundary + 0.15) - now)
             await asyncio.sleep(sleep_duration)
@@ -242,7 +300,6 @@ class MultiTimeframeDataFetcher:
             closed_tfs = self.get_closed_timeframes_at_timestamp(trigger_ts, watched_tfs)
 
             if closed_tfs:
-                # Fetch all newly closed timeframes across all symbols in parallel
                 sync_tasks = []
                 task_meta = []
                 for sym in symbols:
@@ -252,7 +309,6 @@ class MultiTimeframeDataFetcher:
 
                 updated_dfs = await asyncio.gather(*sync_tasks)
 
-                # Trigger immediate agent analysis callback for each newly closed candle
                 if on_candle_close is not None:
                     cb_tasks = [
                         on_candle_close(sym, tf, df)
@@ -265,38 +321,3 @@ class MultiTimeframeDataFetcher:
             cycle_count += 1
             if max_cycles is not None and cycle_count >= max_cycles:
                 break
-
-
-async def _sample_agent_callback(symbol: str, timeframe: str, df: pd.DataFrame) -> None:
-    """Example callback triggered automatically within milliseconds of candle close."""
-    latest = df.iloc[-1]
-    print(
-        f"[AUTO-TRIGGER] {symbol} [{timeframe:>3}] Candle Closed! "
-        f"Time: {latest['timestamp']} | Close: {latest['close']} | Vol: {latest['volume']}"
-    )
-
-
-async def _demo_run():
-    fetcher = MultiTimeframeDataFetcher()
-    try:
-        print("1. Running Initial Warm-up & Parquet Cache Sync for BTCUSDT...")
-        data_map = await fetcher.warm_up_all_timeframes("BTCUSDT", initial_limit=300)
-        for tf, df in data_map.items():
-            cache_path = fetcher._get_cache_file("BTCUSDT", tf)
-            print(
-                f" -> [{tf:>3}] Cached {len(df)} candles | Latest: {df['close'].iloc[-1]} "
-                f"| Parquet Saved: {cache_path.name}"
-            )
-
-        print("\n2. Testing Boundary-Aligned Auto-Trigger (Waiting for next 1m candle close)...")
-        await fetcher.start_auto_stream(
-            symbols=["BTCUSDT"],
-            on_candle_close=_sample_agent_callback,
-            max_cycles=1,  # Runs 1 automatic minute boundary cycle for demo verification
-        )
-    finally:
-        await fetcher.close_exchange()
-
-
-if __name__ == "__main__":
-    asyncio.run(_demo_run())
