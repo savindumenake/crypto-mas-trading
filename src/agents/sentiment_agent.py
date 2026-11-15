@@ -1,10 +1,13 @@
 import asyncio
-import math
+import json
+import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, Optional
 import ccxt.async_support as ccxt
+import numpy as np
 import pandas as pd
 
 # Ensure project root is in sys.path
@@ -14,199 +17,286 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.utils.config_loader import ConfigLoader
 from src.database.db_manager import SegregatedDatabaseManager
-from src.database.models import FundamentalStateLog, TradeExecutionLog
 
 
 class CryptoSentimentAndMicrostructureAgent:
     """
-    Evaluates real-time Crypto Derivatives Sentiment, L2 Orderbook Imbalance,
-    Perpetual Funding Rate positioning, Persistent Macro/Volatility Shock Cooldowns
-    (stored in SQLite FundamentalStateLog), and Sentiment-Matched Historical Trade Lookups.
-    Outputs a 15.0-point Confluence Score + Circuit Breaker Veto flag.
+    Evaluates crypto derivatives sentiment & orderbook microstructure (Max 15.0 Confluence Points).
+    Includes:
+    1. Live Binance USDT-M Futures Funding, Open Interest & L2 Orderbook Imbalance.
+    2. Persistent Post-Shock Cooldown Tracking via Segregated SQLite (`sentiment_cache`).
+       Distinguishes chaotic whipsaw/adverse shocks from clean directional breakouts.
+    3. Sentiment-Matched Historical Trade Lookup (queries last 15 similar trades
+       matching both technical regime AND historical sentiment/funding state).
     """
 
-    SHOCK_COOLDOWN_MINUTES: Dict[str, int] = {
-        "scalp": 45,      # 45 mins cooldown for 1m/5m/15m scalping
-        "intraday": 180,  # 3 hours cooldown for 1h intraday
-        "swing": 480,     # 8 hours cooldown for 4h/1d swing
-    }
-
-    HARD_VETO_MINUTES: Dict[str, int] = {
-        "scalp": 15,
-        "intraday": 45,
-        "swing": 120,
+    COOLDOWN_CONFIG = {
+        "scalp": {"window_minutes": 60, "hard_veto_minutes": 30},
+        "intraday": {"window_minutes": 180, "hard_veto_minutes": 60},
+        "swing": {"window_minutes": 360, "hard_veto_minutes": 120},
     }
 
     def __init__(self, config_path: str = "config/assets_config.yaml"):
         self.config_loader = ConfigLoader(config_path)
-        sys_cfg = self.config_loader.full_config.get("system", {})
-        self.exchange_id = sys_cfg.get("default_exchange", "binance")
-        self.exchange: Optional[ccxt.Exchange] = None
         self.db_manager = SegregatedDatabaseManager(config_path)
-
-    async def initialize_exchange(self) -> None:
-        if self.exchange is None:
-            exchange_class = getattr(ccxt, self.exchange_id)
-            self.exchange = exchange_class(
-                {
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "future"},
-                }
-            )
-
-    async def close_exchange(self) -> None:
-        if self.exchange is not None:
-            await self.exchange.close()
-            self.exchange = None
+        self._exchange: Optional[ccxt.binanceusdm] = None
 
     @staticmethod
-    def _normalize_symbol(symbol: str) -> str:
-        if "/" in symbol:
-            return symbol
-        if symbol.endswith("USDT"):
-            return f"{symbol[:-4]}/USDT"
-        return symbol
+    def _ensure_tables(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sentiment_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc DATETIME DEFAULT CURRENT_TIMESTAMP,
+                symbol TEXT NOT NULL,
+                funding_rate REAL,
+                open_interest_change_pct REAL,
+                long_short_ratio REAL,
+                social_sentiment_score REAL,
+                news_shock_active INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc DATETIME DEFAULT CURRENT_TIMESTAMP,
+                symbol TEXT NOT NULL,
+                horizon TEXT NOT NULL,
+                timeframe TEXT,
+                direction TEXT NOT NULL,
+                pattern_type TEXT,
+                market_regime TEXT,
+                confluence_score REAL,
+                ml_probability REAL,
+                technical_score REAL,
+                sentiment_score REAL,
+                debate_score REAL,
+                entry_price REAL,
+                stop_loss REAL,
+                tp1_price REAL,
+                tp2_price REAL,
+                exit_price REAL,
+                entry_atr REAL,
+                position_size REAL,
+                realized_pnl_r REAL,
+                mae_atr REAL,
+                mfe_atr REAL,
+                feature_vector_json TEXT,
+                shap_top_features_json TEXT,
+                status TEXT DEFAULT 'OPEN'
+            )
+            """
+        )
+
+    @contextmanager
+    def _db_conn(self, horizon: str) -> Iterator[sqlite3.Connection]:
+        """
+        Safely resolves the horizon SQLite connection and ensures required tables exist.
+        """
+        for method_name in ("get_connection", "_get_connection", "connect", "_connect"):
+            if hasattr(self.db_manager, method_name):
+                fn = getattr(self.db_manager, method_name)
+                with fn(horizon) as conn:
+                    conn.row_factory = sqlite3.Row
+                    self._ensure_tables(conn)
+                    yield conn
+                return
+
+        db_path = None
+        if hasattr(self.db_manager, "get_db_path"):
+            db_path = self.db_manager.get_db_path(horizon)
+        elif hasattr(self.db_manager, "db_paths") and isinstance(self.db_manager.db_paths, dict):
+            db_path = self.db_manager.db_paths.get(horizon)
+        else:
+            db_path = self.config_loader.get_db_path(horizon)
+
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            self._ensure_tables(conn)
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def _get_exchange(self) -> ccxt.binanceusdm:
+        if self._exchange is None:
+            self._exchange = ccxt.binanceusdm(
+                {"enableRateLimit": True, "options": {"defaultType": "future"}}
+            )
+        return self._exchange
+
+    async def close_exchange(self) -> None:
+        if self._exchange is not None:
+            await self._exchange.close()
+            self._exchange = None
 
     async def fetch_live_microstructure(self, symbol: str) -> Dict[str, float]:
         """
-        Concurrently fetches live Perpetual Funding Rate and Top-20 L2 Orderbook
-        Bid/Ask volumes from Binance Futures.
+        Fetches live Funding Rate, Open Interest, and L2 Orderbook Bid/Ask Imbalance
+        from Binance USDT-M Perpetual Futures.
         """
-        await self.initialize_exchange()
-        ccxt_symbol = self._normalize_symbol(symbol)
+        exchange = await self._get_exchange()
+        ccxt_symbol = (
+            f"{symbol[:-4]}/USDT:USDT"
+            if symbol.endswith("USDT") and "/" not in symbol
+            else symbol
+        )
 
-        funding_rate = 0.0001
-        ob_imbalance = 0.0
+        funding_rate = 0.0
+        open_interest = 0.0
+        orderbook_imbalance = 0.0
         spread_bps = 1.0
 
         try:
-            funding_task = self.exchange.fetch_funding_rate(ccxt_symbol)
-            ob_task = self.exchange.fetch_order_book(ccxt_symbol, limit=20)
-            funding_res, ob_res = await asyncio.gather(
-                funding_task, ob_task, return_exceptions=True
-            )
-
-            if isinstance(funding_res, dict):
-                raw_fr = funding_res.get("fundingRate")
-                if raw_fr is not None:
-                    funding_rate = float(raw_fr)
-
-            if isinstance(ob_res, dict):
-                bids = ob_res.get("bids", [])
-                asks = ob_res.get("asks", [])
-                bid_vol = sum(float(b[1]) for b in bids[:20]) if bids else 0.0
-                ask_vol = sum(float(a[1]) for a in asks[:20]) if asks else 0.0
-                total_vol = bid_vol + ask_vol
-                if total_vol > 0:
-                    ob_imbalance = (bid_vol - ask_vol) / total_vol
-
-                if bids and asks and float(bids[0][0]) > 0:
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
-                    spread_bps = ((best_ask - best_bid) / best_bid) * 10000.0
+            funding_info = await exchange.fetch_funding_rate(ccxt_symbol)
+            funding_rate = float(funding_info.get("fundingRate") or 0.0)
         except Exception:
-            pass
+            funding_rate = 0.0
+
+        try:
+            oi_info = await exchange.fetch_open_interest(ccxt_symbol)
+            open_interest = float(
+                oi_info.get("openInterestAmount")
+                or oi_info.get("openInterestValue")
+                or 0.0
+            )
+        except Exception:
+            open_interest = 0.0
+
+        try:
+            ob = await exchange.fetch_order_book(ccxt_symbol, limit=20)
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
+            bid_vol = sum(float(b[1]) for b in bids[:20]) if bids else 0.0
+            ask_vol = sum(float(a[1]) for a in asks[:20]) if asks else 0.0
+            total_vol = bid_vol + ask_vol
+            if total_vol > 0:
+                orderbook_imbalance = (bid_vol - ask_vol) / total_vol
+            if bids and asks and bids[0][0] > 0:
+                spread_bps = ((asks[0][0] - bids[0][0]) / bids[0][0]) * 10000.0
+        except Exception:
+            orderbook_imbalance = 0.0
 
         return {
             "funding_rate": round(funding_rate, 6),
-            "orderbook_imbalance": round(ob_imbalance, 4),
+            "open_interest": round(open_interest, 2),
+            "orderbook_imbalance": round(orderbook_imbalance, 4),
             "spread_bps": round(spread_bps, 3),
         }
 
     # -----------------------------------------------------------------
-    # 1. PERSISTENT SHOCK MEMORY & COOLDOWN DECAY (DATABASE-BACKED)
+    # 1. PERSISTENT SHOCK COOLDOWN TRACKING (SQLITE SENTIMENT_CACHE)
     # -----------------------------------------------------------------
-    def persist_sentiment_and_check_cooldown(
+    def record_sentiment_snapshot(
         self,
-        symbol: str,
         horizon: str,
+        symbol: str,
         funding_rate: float,
-        ob_imbalance: float,
-        sentiment_score_norm: float,
-        current_shock_detected: bool,
-        summary_text: str = "",
-    ) -> Dict[str, Any]:
-        """
-        Saves the current sentiment state to `fundamental_state_logs` in the horizon DB
-        and checks if ANY shock occurred within the horizon's cooldown window.
-        Applies an exponential time-decay penalty as the shock ages.
-        """
-        cooldown_mins = self.SHOCK_COOLDOWN_MINUTES.get(horizon, 60)
-        hard_veto_mins = self.HARD_VETO_MINUTES.get(horizon, 15)
-        now_utc = datetime.now(timezone.utc)
-        cutoff_utc = now_utc - timedelta(minutes=cooldown_mins)
-
-        # Derive sentiment_label from score & orderbook pressure
-        composite_signal = sentiment_score_norm + (ob_imbalance * 0.5)
-        if composite_signal > 0.10:
-            sentiment_label = "BULLISH"
-        elif composite_signal < -0.10:
-            sentiment_label = "BEARISH"
-        else:
-            sentiment_label = "NEUTRAL"
-
-        summary_val = summary_text or f"OB_Imb={ob_imbalance:.3f}, FR={funding_rate:.5f}"
-
-        valid_cols = {c.name for c in FundamentalStateLog.__table__.columns}
-        candidate_kwargs = {
-            "symbol": symbol,
-            "timestamp": now_utc,
-            "sentiment_score": sentiment_score_norm,
-            "sentiment_label": sentiment_label,
-            "impact_horizon": horizon,
-            "funding_rate": funding_rate,
-            "open_interest_change_pct": round(ob_imbalance * 100.0, 2),
-            "news_shock_active": current_shock_detected,
-            "summary_text": summary_val,
-            "retrieval_query_text": f"{symbol}_{horizon}_{sentiment_label}",
-            "dominant_narrative": summary_val,
-            "summary_context": summary_val,
-        }
-        filtered_kwargs = {k: v for k, v in candidate_kwargs.items() if k in valid_cols}
-
-        with self.db_manager._get_session(horizon) as session:
-            log_entry = FundamentalStateLog(**filtered_kwargs)
-            session.add(log_entry)
-            session.commit()
-
-            recent_shock = (
-                session.query(FundamentalStateLog)
-                .filter(
-                    FundamentalStateLog.symbol == symbol,
-                    FundamentalStateLog.news_shock_active.is_(True),
-                    FundamentalStateLog.timestamp >= cutoff_utc,
-                )
-                .order_by(FundamentalStateLog.timestamp.desc())
-                .first()
+        open_interest: float,
+        orderbook_imbalance: float,
+        social_sentiment: float,
+        news_shock_active: bool,
+    ) -> None:
+        """Persists live derivatives & shock status into the horizon's SQLite DB."""
+        with self._db_conn(horizon) as conn:
+            conn.execute(
+                """
+                INSERT INTO sentiment_cache (
+                    symbol, funding_rate, open_interest_change_pct,
+                    long_short_ratio, social_sentiment_score, news_shock_active
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    float(funding_rate),
+                    float(open_interest),
+                    float(orderbook_imbalance),
+                    float(social_sentiment),
+                    1 if news_shock_active else 0,
+                ),
             )
 
-            if recent_shock is None:
-                return {
-                    "in_cooldown_window": False,
-                    "hard_veto_active": False,
-                    "minutes_since_shock": None,
-                    "shock_decay_penalty_factor": 0.0,
-                }
+    def clear_symbol_shocks(self, horizon: str, symbol: str) -> None:
+        """Clears active shock flags for a symbol in the horizon DB (useful for reset/tests)."""
+        with self._db_conn(horizon) as conn:
+            conn.execute(
+                "UPDATE sentiment_cache SET news_shock_active = 0 WHERE symbol = ?",
+                (symbol,),
+            )
 
-            shock_ts = recent_shock.timestamp
-            if shock_ts.tzinfo is None:
-                shock_ts = shock_ts.replace(tzinfo=timezone.utc)
+    def get_post_shock_cooldown_state(
+        self, horizon: str, symbol: str
+    ) -> Dict[str, Any]:
+        """
+        Checks the horizon SQLite database for any news/volatility shock recorded
+        within the horizon's cooldown window and computes a time-decay stability factor.
+        """
+        cfg = self.COOLDOWN_CONFIG.get(horizon, self.COOLDOWN_CONFIG["scalp"])
+        window_mins = cfg["window_minutes"]
+        veto_mins = cfg["hard_veto_minutes"]
 
-            elapsed_mins = max(0.0, (now_utc - shock_ts).total_seconds() / 60.0)
-            hard_veto = elapsed_mins <= hard_veto_mins
+        with self._db_conn(horizon) as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp_utc
+                FROM sentiment_cache
+                WHERE symbol = ? AND news_shock_active = 1
+                ORDER BY id DESC LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
 
-            decay_lambda = 2.3 / max(cooldown_mins, 1)
-            penalty_factor = round(math.exp(-decay_lambda * elapsed_mins), 4)
-
+        if not row or not row["timestamp_utc"]:
             return {
-                "in_cooldown_window": True,
-                "hard_veto_active": hard_veto,
-                "minutes_since_shock": round(elapsed_mins, 1),
-                "shock_decay_penalty_factor": penalty_factor,
+                "in_cooldown_window": False,
+                "hard_veto_active": False,
+                "minutes_since_shock": None,
+                "cooldown_stability_factor": 1.0,
             }
 
+        ts_str = str(row["timestamp_utc"])
+        try:
+            shock_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if shock_dt.tzinfo is None:
+                shock_dt = shock_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            shock_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+
+        now_utc = datetime.now(timezone.utc)
+        elapsed_mins = max(0.0, (now_utc - shock_dt).total_seconds() / 60.0)
+
+        if elapsed_mins <= veto_mins:
+            return {
+                "in_cooldown_window": True,
+                "hard_veto_active": True,
+                "minutes_since_shock": round(elapsed_mins, 1),
+                "cooldown_stability_factor": 0.0,
+            }
+        elif elapsed_mins < window_mins:
+            recovery_span = max(1.0, float(window_mins - veto_mins))
+            factor = (elapsed_mins - veto_mins) / recovery_span
+            return {
+                "in_cooldown_window": True,
+                "hard_veto_active": False,
+                "minutes_since_shock": round(elapsed_mins, 1),
+                "cooldown_stability_factor": round(float(np.clip(factor, 0.1, 1.0)), 3),
+            }
+
+        return {
+            "in_cooldown_window": False,
+            "hard_veto_active": False,
+            "minutes_since_shock": round(elapsed_mins, 1),
+            "cooldown_stability_factor": 1.0,
+        }
+
     # -----------------------------------------------------------------
-    # 2. SENTIMENT-MATCHED 15-TRADE HISTORICAL MEMORY LOOKUP
+    # 2. SENTIMENT-MATCHED 15 HISTORICAL TRADES LOOKUP
     # -----------------------------------------------------------------
     def get_sentiment_matched_historical_trades(
         self,
@@ -219,62 +309,67 @@ class CryptoSentimentAndMicrostructureAgent:
         top_k: int = 15,
     ) -> Dict[str, Any]:
         """
-        Retrieves closed historical trades matching `pattern_type` and `market_regime`,
-        then ranks and selects the `top_k` (15) trades whose historical sentiment score
-        and funding regime at trade entry were closest to the current live sentiment.
+        Queries the last closed trades from the horizon DB and ranks the top `top_k` (15)
+        historical setups that match both the technical pattern/regime AND similar
+        sentiment/funding conditions.
         """
-        with self.db_manager._get_session(horizon) as session:
-            candidates: List[TradeExecutionLog] = (
-                session.query(TradeExecutionLog)
-                .filter(
-                    TradeExecutionLog.symbol == symbol,
-                    TradeExecutionLog.pattern_type == pattern_type,
-                    TradeExecutionLog.market_regime == market_regime,
-                    TradeExecutionLog.status == "CLOSED",
-                )
-                .order_by(TradeExecutionLog.exit_timestamp.desc())
-                .limit(60)
-                .all()
-            )
+        with self._db_conn(horizon) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, direction, pattern_type, market_regime, sentiment_score,
+                       realized_pnl_r, mae_atr, mfe_atr, feature_vector_json
+                FROM trade_memory
+                WHERE symbol = ? AND status = 'CLOSED'
+                ORDER BY id DESC LIMIT 60
+                """,
+                (symbol,),
+            ).fetchall()
 
-            if not candidates:
-                return {
-                    "matched_trades_count": 0,
-                    "sentiment_matched_win_rate": 0.50,
-                    "avg_historical_sentiment": 0.0,
-                    "sentiment_similarity_confidence": 0.0,
-                }
-
-            scored_candidates = []
-            for t in candidates:
-                hist_sent = float(t.sentiment_score if t.sentiment_score is not None else 7.5)
-                hist_meta = t.feature_vector_json or {}
-                hist_f_regime = hist_meta.get("funding_regime", "UNKNOWN")
-
-                sent_diff = abs(current_sentiment_score - hist_sent)
-                regime_bonus = 0.0 if hist_f_regime == current_funding_regime else 2.5
-                total_distance = sent_diff + regime_bonus
-
-                scored_candidates.append((total_distance, t))
-
-            scored_candidates.sort(key=lambda x: x[0])
-            selected = [t for _, t in scored_candidates[:top_k]]
-
-            wins = sum(1 for t in selected if t.is_win)
-            win_rate = wins / len(selected)
-            avg_sent = sum(float(t.sentiment_score or 0.0) for t in selected) / len(selected)
-            avg_dist = sum(d for d, _ in scored_candidates[:top_k]) / len(selected)
-            sim_conf = max(0.0, 1.0 - (avg_dist / 15.0))
-
+        if not rows:
             return {
-                "matched_trades_count": len(selected),
-                "sentiment_matched_win_rate": round(win_rate, 4),
-                "avg_historical_sentiment": round(avg_sent, 2),
-                "sentiment_similarity_confidence": round(sim_conf, 4),
+                "matched_trades_count": 0,
+                "sentiment_matched_win_rate": 0.50,
+                "avg_historical_sentiment": 0.0,
+                "sentiment_similarity_confidence": 0.0,
             }
 
+        scored_matches = []
+        for r in rows:
+            hist_sent = float(r["sentiment_score"] or 7.5)
+            sent_diff = abs(current_sentiment_score - hist_sent)
+            sent_sim = max(0.0, 1.0 - (sent_diff / 15.0))
+
+            pat_bonus = 0.25 if r["pattern_type"] == pattern_type else 0.0
+            reg_bonus = 0.15 if r["market_regime"] == market_regime else 0.0
+
+            fund_bonus = 0.0
+            try:
+                fv = json.loads(r["feature_vector_json"] or "{}")
+                if fv.get("funding_regime") == current_funding_regime:
+                    fund_bonus = 0.20
+            except Exception:
+                pass
+
+            total_sim = min(1.0, (sent_sim * 0.60) + pat_bonus + reg_bonus + fund_bonus)
+            scored_matches.append((total_sim, r))
+
+        scored_matches.sort(key=lambda x: x[0], reverse=True)
+        selected = [item[1] for item in scored_matches[:top_k]]
+        sims = [item[0] for item in scored_matches[:top_k]]
+
+        wins = sum(1 for r in selected if float(r["realized_pnl_r"] or 0.0) > 0)
+        win_rate = wins / len(selected)
+        avg_sent = float(np.mean([float(r["sentiment_score"] or 7.5) for r in selected]))
+
+        return {
+            "matched_trades_count": len(selected),
+            "sentiment_matched_win_rate": round(win_rate, 4),
+            "avg_historical_sentiment": round(avg_sent, 2),
+            "sentiment_similarity_confidence": round(float(np.mean(sims)), 3),
+        }
+
     # -----------------------------------------------------------------
-    # 3. 15-POINT SENTIMENT & MICROSTRUCTURE CONFLUENCE EVALUATION
+    # 3. MAIN 15-POINT SENTIMENT CONFLUENCE EVALUATOR
     # -----------------------------------------------------------------
     def evaluate_sentiment_confluence(
         self,
@@ -287,144 +382,167 @@ class CryptoSentimentAndMicrostructureAgent:
         news_shock_flag: bool = False,
         max_points: float = 15.0,
     ) -> Dict[str, Any]:
-        if target_direction not in ("LONG", "SHORT"):
-            target_direction = "LONG"
+        """
+        Computes the 15-point Sentiment & Microstructure Confluence Score and updates
+        persistent cooldown state in SQLite.
+        """
+        if microstructure is None:
+            if df is not None and not df.empty:
+                last = df.iloc[-1]
+                ob_proxy = float(
+                    np.clip(
+                        (last.get("close", 1.0) - last.get("open", 1.0))
+                        / (last.get("atr_14", 1.0) + 1e-8)
+                        * 0.25,
+                        -0.6,
+                        0.6,
+                    )
+                )
+                microstructure = {
+                    "funding_rate": 0.0001,
+                    "open_interest": float(last.get("volume", 0.0)),
+                    "orderbook_imbalance": round(ob_proxy, 4),
+                    "spread_bps": 1.2,
+                }
+            else:
+                microstructure = {
+                    "funding_rate": 0.0001,
+                    "open_interest": 0.0,
+                    "orderbook_imbalance": 0.0,
+                    "spread_bps": 1.0,
+                }
 
-        ms = microstructure or {
-            "funding_rate": 0.0001,
-            "orderbook_imbalance": 0.0,
-            "spread_bps": 1.0,
-        }
-        funding_rate = float(ms.get("funding_rate", 0.0001))
-        ob_imb = float(ms.get("orderbook_imbalance", 0.0))
-        spread_bps = float(ms.get("spread_bps", 1.0))
+        funding = float(microstructure.get("funding_rate", 0.0))
+        oi_val = float(microstructure.get("open_interest", 0.0))
+        ob_imb = float(microstructure.get("orderbook_imbalance", 0.0))
+        spread_bps = float(microstructure.get("spread_bps", 1.0))
 
-        # 1. Orderbook Imbalance Score (0 to 6.0 points)
+        # Detect anomalous volatility shock vs. clean directional breakout
+        detected_shock = bool(news_shock_flag)
+        if df is not None and len(df) >= 20:
+            recent_ranges = (df["high"] - df["low"]).tail(20)
+            median_range = float(recent_ranges.iloc[:-1].median()) + 1e-8
+            latest_range = float(recent_ranges.iloc[-1])
+
+            if latest_range > (median_range * 4.2):
+                last_open = float(df["open"].iloc[-1])
+                last_close = float(df["close"].iloc[-1])
+                body_size = abs(last_close - last_open)
+                body_ratio = body_size / (latest_range + 1e-8)
+
+                is_bull_bar = last_close > last_open
+                aligned_move = (target_direction == "LONG" and is_bull_bar) or (
+                    target_direction == "SHORT" and not is_bull_bar
+                )
+
+                # Clean directional breakout (body >= 45% in trade direction) is NOT a shock veto
+                if not (aligned_move and body_ratio >= 0.45):
+                    detected_shock = True
+
+        self.record_sentiment_snapshot(
+            horizon=horizon,
+            symbol=symbol,
+            funding_rate=funding,
+            open_interest=oi_val,
+            orderbook_imbalance=ob_imb,
+            social_sentiment=external_news_sentiment,
+            news_shock_active=detected_shock,
+        )
+        cooldown_state = self.get_post_shock_cooldown_state(horizon, symbol)
+
+        # Component A: Orderbook Imbalance Alignment (0.0 to 6.0 pts)
         aligned_ob = ob_imb if target_direction == "LONG" else -ob_imb
-        ob_score = min(6.0, max(0.0, ((aligned_ob + 0.25) / 0.60) * 6.0))
+        ob_score = float(np.clip((aligned_ob + 0.30) / 0.60, 0.0, 1.0) * 6.0)
+        if spread_bps > 8.0:
+            ob_score *= 0.5
 
-        # 2. Perpetual Funding Rate & Squeeze Filter (0 to 5.0 points)
+        # Component B: Derivatives Funding & Crowding Filter (0.0 to 5.0 pts)
         funding_regime = "NEUTRAL_POSITIONING"
         if target_direction == "LONG":
-            if funding_rate < 0.0:
+            if funding < -0.0002:
                 funding_score = 5.0
                 funding_regime = "SHORT_SQUEEZE_FUEL"
-            elif funding_rate <= 0.00025:
+            elif funding <= 0.0003:
                 funding_score = 4.0
                 funding_regime = "HEALTHY_BULL_FUNDING"
-            elif funding_rate <= 0.0005:
-                funding_score = 2.0
+            elif funding <= 0.0008:
+                funding_score = 2.2
                 funding_regime = "ELEVATED_LONG_FUNDING"
             else:
-                funding_score = 0.0
-                funding_regime = "OVERCROWDED_LONGS_WARNING"
+                funding_score = 0.5
+                funding_regime = "CROWDED_LONG_SQUEEZE_WARNING"
         else:
-            if funding_rate > 0.00035:
+            if funding > 0.0003:
                 funding_score = 5.0
-                funding_regime = "LONG_LIQUIDATION_FUEL"
-            elif funding_rate >= 0.0:
-                funding_score = 3.5
-                funding_regime = "NORMAL_FUNDING"
-            elif funding_rate >= -0.00025:
-                funding_score = 2.0
+                funding_regime = "LONG_SQUEEZE_FUEL"
+            elif funding >= -0.0002:
+                funding_score = 4.0
+                funding_regime = "HEALTHY_BEAR_FUNDING"
+            elif funding >= -0.0006:
+                funding_score = 2.2
                 funding_regime = "ELEVATED_SHORT_FUNDING"
             else:
-                funding_score = 0.0
-                funding_regime = "OVERCROWDED_SHORTS_WARNING"
+                funding_score = 0.5
+                funding_regime = "CROWDED_SHORT_SQUEEZE_WARNING"
 
-        # 3. Point-in-Time Volatility Shock Detection + Persistent DB Cooldown Check
-        instant_shock = bool(news_shock_flag)
-        if df is not None and len(df) >= 25:
-            high_low_range = (df["high"] - df["low"]).astype("float64")
-            latest_range = float(high_low_range.iloc[-1])
-            median_range = float(high_low_range.iloc[-25:-1].median())
-            if median_range > 0 and (latest_range / median_range) >= 3.8:
-                instant_shock = True
-
-        if spread_bps > 15.0:
-            instant_shock = True
-
+        # Component C: Macro Stability & Post-Shock Cooldown Recovery (0.0 to 4.0 pts)
         aligned_news = (
             external_news_sentiment
             if target_direction == "LONG"
             else -external_news_sentiment
         )
-        raw_macro_score = min(4.0, max(0.0, 2.5 + (aligned_news * 3.0)))
+        raw_macro_score = float(np.clip(2.5 + (aligned_news * 1.5), 0.5, 4.0))
+        macro_score = raw_macro_score * cooldown_state["cooldown_stability_factor"]
 
-        # Persist state & check if we are still inside the post-news shock cooldown window
-        cooldown_info = self.persist_sentiment_and_check_cooldown(
-            symbol=symbol,
-            horizon=horizon,
-            funding_rate=funding_rate,
-            ob_imbalance=ob_imb,
-            sentiment_score_norm=external_news_sentiment,
-            current_shock_detected=instant_shock,
-        )
-
-        penalty_factor = cooldown_info["shock_decay_penalty_factor"]
-        macro_score = raw_macro_score * (1.0 - penalty_factor)
-        if cooldown_info["hard_veto_active"]:
+        hard_veto = bool(detected_shock or cooldown_state["hard_veto_active"])
+        if hard_veto:
             macro_score = 0.0
 
-        total_sentiment_score = round(
-            min(max_points, ob_score + funding_score + macro_score), 2
-        )
+        total_score = round(min(max_points, ob_score + funding_score + macro_score), 2)
 
         return {
             "symbol": symbol,
             "horizon": horizon,
             "evaluated_direction": target_direction,
-            "sentiment_confluence_score": total_sentiment_score,
-            "funding_rate": funding_rate,
+            "sentiment_confluence_score": total_score,
             "funding_regime": funding_regime,
+            "funding_rate": funding,
             "orderbook_imbalance": ob_imb,
             "spread_bps": spread_bps,
-            "news_shock_veto": cooldown_info["hard_veto_active"],
-            "cooldown_state": cooldown_info,
+            "news_shock_veto": hard_veto,
+            "cooldown_state": cooldown_state,
             "score_breakdown": {
-                "orderbook_pressure_score": round(ob_score, 2),
-                "funding_positioning_score": round(funding_score, 2),
+                "orderbook_score": round(ob_score, 2),
+                "funding_score": round(funding_score, 2),
                 "macro_stability_score": round(macro_score, 2),
             },
             "sentiment_memory_snapshot": {
-                "sentiment_score": total_sentiment_score,
-                "funding_rate": funding_rate,
+                "sentiment_score": total_score,
                 "funding_regime": funding_regime,
+                "funding_rate": funding,
                 "orderbook_imbalance": ob_imb,
             },
         }
 
-    async def analyze_live(
-        self,
-        symbol: str,
-        target_direction: str = "LONG",
-        horizon: str = "scalp",
-        df: Optional[pd.DataFrame] = None,
-        external_news_sentiment: float = 0.0,
-    ) -> Dict[str, Any]:
-        ms = await self.fetch_live_microstructure(symbol)
-        return self.evaluate_sentiment_confluence(
-            symbol=symbol,
-            target_direction=target_direction,
-            horizon=horizon,
-            df=df,
-            microstructure=ms,
-            external_news_sentiment=external_news_sentiment,
-        )
 
-
-async def _demo_run():
+async def _demo():
     agent = CryptoSentimentAndMicrostructureAgent()
     try:
-        cache_file = PROJECT_ROOT / "data" / "cache" / "BTCUSDT_5m.parquet"
-        df = pd.read_parquet(cache_file).tail(50) if cache_file.exists() else None
-        res = await agent.analyze_live("BTCUSDT", target_direction="LONG", horizon="scalp", df=df)
-        print("Live BTCUSDT Sentiment, Cooldown Memory & Orderbook Output:")
+        ms = await agent.fetch_live_microstructure("BTCUSDT")
+        res = agent.evaluate_sentiment_confluence(
+            symbol="BTCUSDT",
+            target_direction="LONG",
+            horizon="scalp",
+            microstructure=ms,
+            external_news_sentiment=0.25,
+            news_shock_flag=False,
+        )
+        print("Live Sentiment & Cooldown Confluence Output:")
         for k, v in res.items():
-            print(f"  {k:<28}: {v}")
+            print(f"  {k}: {v}")
     finally:
         await agent.close_exchange()
 
 
 if __name__ == "__main__":
-    asyncio.run(_demo_run())
+    asyncio.run(_demo())
