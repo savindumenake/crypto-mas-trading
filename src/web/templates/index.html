@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeuralPulse Quant AI | Institutional Multi-Horizon Signal Terminal</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { background-color: #070A0F; color: #E2E8F0; font-family: 'Inter', sans-serif; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .glass { background: rgba(15, 21, 32, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
+    .vip-blur { filter: blur(7px); user-select: none; pointer-events: none; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .live-dot { animation: pulse-dot 1.4s infinite; }
+  </style>
+</head>
+<body class="min-h-screen antialiased p-4 lg:p-7 max-w-[1600px] mx-auto space-y-6">
+
+  <!-- Toast Notification -->
+  <div id="toast" class="hidden fixed bottom-6 right-6 z-50 bg-emerald-500 text-slate-950 font-bold px-5 py-3 rounded-xl shadow-2xl border border-emerald-300 text-sm"></div>
+
+  <!-- Header -->
+  <header class="glass rounded-2xl px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center gap-4">
+      <div class="w-11 h-11 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-slate-950 font-black text-xl shadow-lg">NP</div>
+      <div>
+        <div class="flex items-center gap-2.5">
+          <h1 class="text-lg font-extrabold tracking-tight text-white">NEURALPULSE QUANT AI</h1>
+          <span class="px-2.5 py-0.5 text-[11px] font-bold uppercase rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">v1.0 Commercial SaaS</span>
+          <span id="wsStatusBadge" class="px-2.5 py-0.5 text-[11px] mono font-semibold rounded-full bg-slate-800 text-slate-400 border border-slate-700 flex items-center gap-1.5">
+            <span id="wsDot" class="w-2 h-2 rounded-full bg-amber-400 live-dot"></span>
+            <span id="wsText">Connecting Live Feed...</span>
+          </span>
+        </div>
+        <p class="text-xs text-slate-400">6-Node LangGraph Multi-Agent Signal Engine • Segregated Multi-Horizon Ledgers • TreeSHAP</p>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-3">
+      <div class="flex items-center bg-slate-900 p-1 rounded-xl border border-slate-800">
+        <button id="btnFree" onclick="setVipMode(false)" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">🔓 Free Member</button>
+        <button id="btnVip" onclick="setVipMode(true)" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-amber-400 to-emerald-400 text-slate-950 shadow transition">👑 VIP Institutional</button>
+      </div>
+      <button id="btnScan" onclick="runLiveScan()" class="px-4 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">🔄 Live Rescan (Binance)</button>
+      <button id="btnDemo" onclick="dispatchDemoTrade()" class="px-4 py-2 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg transition">⚡ Dispatch Demo Signal + Telegram</button>
+      <a href="/docs" target="_blank" class="px-3 py-2 rounded-xl text-xs mono bg-slate-900 text-slate-400 hover:text-white border border-slate-800">API /docs ↗</a>
+    </div>
+  </header>
+
+  <!-- 3 Horizon Selector Tabs -->
+  <div id="horizonTabs" class="grid grid-cols-1 md:grid-cols-3 gap-4"></div>
+
+  <!-- 6 KPI Cards -->
+  <div id="kpiGrid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3"></div>
+
+  <!-- Main Grid -->
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+    <!-- Left 7 Cols: Chart + Risk Levels + Calculator -->
+    <div class="lg:col-span-7 space-y-5">
+      <div class="glass rounded-2xl p-5 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-3">
+            <div id="symbolBtns" class="flex gap-1.5"></div>
+            <span id="latestPrice" class="mono text-xl font-extrabold text-emerald-400 transition-colors duration-150">$0.00</span>
+            <span id="tfBadge" class="mono text-xs px-2.5 py-1 rounded-md bg-slate-800 text-slate-300">TF: 5m</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span id="biasBadge" class="px-3 py-1 rounded-lg mono text-xs font-extrabold"></span>
+            <span id="tierBadge" class="px-3 py-1 rounded-lg mono text-xs font-bold bg-slate-900 border border-slate-700 text-amber-300"></span>
+          </div>
+        </div>
+
+        <!-- Candlestick Chart Container -->
+        <div id="tvChart" class="w-full h-[380px] rounded-xl overflow-hidden border border-slate-800 bg-[#0B0F17]"></div>
+
+        <!-- Execution Levels -->
+        <div class="relative">
+          <div id="vipLockOverlay" class="hidden absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-950/75 rounded-xl border border-amber-500/40 p-4 text-center">
+            <p class="text-sm font-extrabold text-amber-300">🔒 Institutional Entry, ATR Stop-Loss & Split TP Targets Locked</p>
+            <button onclick="setVipMode(true)" class="mt-2 px-4 py-1.5 rounded-lg bg-amber-400 text-slate-950 font-bold text-xs">Unlock VIP Institutional View</button>
+          </div>
+          <div id="riskPlanGrid" class="grid grid-cols-2 sm:grid-cols-4 gap-3"></div>
+        </div>
+      </div>
+
+      <!-- Interactive Position Size Calculator -->
+      <div class="glass rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-extrabold text-white uppercase tracking-wider">🧮 Interactive Position Size Calculator</h3>
+          <span class="text-xs text-slate-400">Dynamic ATR Risk Sizing</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 items-center">
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Account Balance ($)</label>
+            <input id="calcBalance" type="number" value="1000" oninput="updateCalculator()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 mono text-sm text-white" />
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Risk Per Trade (%)</label>
+            <input id="calcRisk" type="number" step="0.25" value="1.0" oninput="updateCalculator()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 mono text-sm text-white" />
+          </div>
+          <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
+            <span class="text-[11px] text-slate-400">Dollar Risk At Stop</span>
+            <p id="calcRiskUsdt" class="mono text-base font-bold text-amber-300">$10.00 USDT</p>
+          </div>
+          <div class="bg-slate-900/80 p-3 rounded-xl border border-emerald-500/30">
+            <span class="text-[11px] text-slate-400">Recommended Order Size</span>
+            <p id="calcOrderSize" class="mono text-base font-bold text-emerald-400">0.0000 BTC</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right 5 Cols: 100-Pt Score + SHAP + Debate -->
+    <div class="lg:col-span-5 space-y-5">
+      <div class="glass rounded-2xl p-5 space-y-4">
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-extrabold uppercase tracking-wider text-white">🧠 100-Point AI Confluence Matrix</h2>
+            <p class="text-xs text-slate-400">6-Node LangGraph Orchestrated Score</p>
+          </div>
+          <div class="text-right">
+            <span id="totalScore" class="mono text-2xl font-black text-emerald-400">0.0</span>
+            <span class="mono text-sm text-slate-400"> / 100</span>
+          </div>
+        </div>
+        <div id="scoreBars" class="space-y-3 text-xs"></div>
+        <div id="regimeChips" class="pt-2 border-t border-slate-800 flex flex-wrap gap-2 text-xs"></div>
+      </div>
+
+      <div class="glass rounded-2xl p-5 space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-extrabold uppercase tracking-wider text-white">🔬 Explainable AI (SHAP Top Drivers)</h3>
+          <span class="mono text-[11px] text-emerald-400">TreeSHAP Attribution</span>
+        </div>
+        <div id="shapList" class="space-y-2"></div>
+      </div>
+
+      <div class="glass rounded-2xl p-5 space-y-3">
+        <h3 class="text-sm font-extrabold uppercase tracking-wider text-white">⚖️ Adversarial AI Debate & Judge Verdict</h3>
+        <div id="debateBox" class="space-y-2.5 text-xs"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active Trades Table -->
+  <div class="glass rounded-2xl p-5 space-y-3">
+    <div class="flex items-center justify-between">
+      <div>
+        <h3 id="ledgerTitle" class="text-sm font-extrabold uppercase tracking-wider text-white">📡 Active Trade Lifecycle Monitor</h3>
+        <p id="ledgerDbPath" class="text-xs text-slate-400"></p>
+      </div>
+      <span id="activeCountBadge" class="mono text-xs px-3 py-1 rounded-full bg-slate-900 border border-slate-700 text-slate-300">Active: 0</span>
+    </div>
+    <div id="activeTradesContainer"></div>
+  </div>
+
+  <script>
+    let appState = null;
+    let currentHorizon = "scalp";
+    let currentSymbol = "BTCUSDT";
+    let isVip = true;
+    let tvChartInstance = null;
+    let tvCandleSeries = null;
+    let liveWs = null;
+    let lastLivePrice = 0;
+
+    const HORIZON_META = {
+      scalp: { label: "⚡ SCALP ENGINE", sub: "5m Entry • 1h HTF Gate", badge: "5m High-Frequency", border: "border-amber-500/60", tf: "5m" },
+      intraday: { label: "📈 INTRADAY ENGINE", sub: "15m Entry • 4h HTF Gate", badge: "15m Day-Trading", border: "border-cyan-500/60", tf: "15m" },
+      swing: { label: "🌊 SWING ENGINE", sub: "1h Entry • 4h HTF Gate", badge: "1h Multi-Day Trend", border: "border-purple-500/60", tf: "1h" }
+    };
+
+    function showToast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      setTimeout(() => el.classList.add("hidden"), 4500);
+    }
+
+    function setVipMode(val) {
+      isVip = val;
+      document.getElementById("btnVip").className = isVip
+        ? "px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-amber-400 to-emerald-400 text-slate-950 shadow"
+        : "px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white";
+      document.getElementById("btnFree").className = !isVip
+        ? "px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-700 text-white"
+        : "px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white";
+      renderAll();
+    }
+
+    async function loadState(force = false) {
+      try {
+        const res = await fetch(`/api/v1/state?force_refresh=${force}`);
+        appState = await res.json();
+        if (appState.symbols_scanned && appState.symbols_scanned.length > 0 && !appState.symbols_scanned.includes(currentSymbol)) {
+          currentSymbol = appState.symbols_scanned[0];
+        }
+        renderAll();
+        await syncLiveBinanceKlinesAndConnectStream();
+      } catch (err) {
+        console.error("Failed to fetch state:", err);
+      }
+    }
+
+    async function runLiveScan() {
+      const btn = document.getElementById("btnScan");
+      btn.textContent = "⏳ Scanning Live Binance...";
+      btn.disabled = true;
+      try {
+        const res = await fetch("/api/v1/scan?fetch_live=true&send_telegram=true", { method: "POST" });
+        appState = await res.json();
+        renderAll();
+        await syncLiveBinanceKlinesAndConnectStream();
+        showToast("✅ Live Binance Multi-Horizon AI Scan Completed!");
+      } finally {
+        btn.textContent = "🔄 Live Rescan (Binance)";
+        btn.disabled = false;
+      }
+    }
+
+    async function dispatchDemoTrade() {
+      const btn = document.getElementById("btnDemo");
+      btn.textContent = "⏳ Sending...";
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/v1/simulate-demo-trade?horizon=${currentHorizon}&symbol=${currentSymbol}&send_telegram=true`, { method: "POST" });
+        const out = await res.json();
+        await loadState(false);
+        const sent = out.telegram_dispatch && out.telegram_dispatch.sent;
+        showToast(sent ? `🚀 Opened ${currentHorizon.toUpperCase()} Trade & Sent Alert to @NeuralPulse_Trading!` : `⚡ Opened ${currentHorizon.toUpperCase()} Paper Trade!`);
+      } finally {
+        btn.textContent = "⚡ Dispatch Demo Signal + Telegram";
+        btn.disabled = false;
+      }
+    }
+
+    function selectHorizon(h) {
+      currentHorizon = h;
+      renderAll();
+      syncLiveBinanceKlinesAndConnectStream();
+    }
+
+    function selectSymbol(s) {
+      currentSymbol = s;
+      renderAll();
+      syncLiveBinanceKlinesAndConnectStream();
+    }
+
+    // Fetches real-time latest 80 candles directly from Binance REST + connects live WebSocket tick stream
+    async function syncLiveBinanceKlinesAndConnectStream() {
+      const tf = HORIZON_META[currentHorizon]?.tf || "5m";
+      const symUpper = currentSymbol.toUpperCase();
+      const symLower = currentSymbol.toLowerCase();
+
+      // 1. Pull latest live candles directly from Binance public API so chart is up to the current second
+      try {
+        const resp = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symUpper}&interval=${tf}&limit=80`);
+        if (resp.ok) {
+          const rawKlines = await resp.json();
+          const liveCandles = rawKlines.map(k => ({
+            time: Math.floor(Number(k[0]) / 1000),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5])
+          }));
+          if (tvCandleSeries && liveCandles.length > 0) {
+            tvCandleSeries.setData(liveCandles);
+            tvChartInstance.timeScale().fitContent();
+            const latestClose = liveCandles[liveCandles.length - 1].close;
+            updateLivePriceDisplay(latestClose);
+          }
+        }
+      } catch (e) {
+        console.warn("Binance REST fallback to cached candles:", e);
+      }
+
+      // 2. Connect real-time WebSocket stream for sub-second tick updates
+      if (liveWs) {
+        liveWs.onclose = null;
+        liveWs.close();
+        liveWs = null;
+      }
+
+      const wsUrl = `wss://stream.binance.com:9443/ws/${symLower}@kline_${tf}`;
+      const wsDot = document.getElementById("wsDot");
+      const wsText = document.getElementById("wsText");
+
+      try {
+        liveWs = new WebSocket(wsUrl);
+        liveWs.onopen = () => {
+          wsDot.className = "w-2 h-2 rounded-full bg-emerald-400 live-dot";
+          wsText.textContent = `LIVE STREAM (${symUpper} ${tf})`;
+          wsText.className = "text-emerald-400";
+        };
+        liveWs.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+          if (!msg.k) return;
+          const k = msg.k;
+          const liveBar = {
+            time: Math.floor(Number(k.t) / 1000),
+            open: parseFloat(k.o),
+            high: parseFloat(k.h),
+            low: parseFloat(k.l),
+            close: parseFloat(k.c)
+          };
+          if (tvCandleSeries) {
+            tvCandleSeries.update(liveBar);
+          }
+          updateLivePriceDisplay(liveBar.close);
+        };
+        liveWs.onerror = () => {
+          wsDot.className = "w-2 h-2 rounded-full bg-rose-400";
+          wsText.textContent = "Cached Feed Mode";
+        };
+      } catch (err) {
+        console.warn("WebSocket error:", err);
+      }
+    }
+
+    function updateLivePriceDisplay(newPrice) {
+      const priceEl = document.getElementById("latestPrice");
+      if (!priceEl) return;
+      if (lastLivePrice > 0) {
+        if (newPrice > lastLivePrice) {
+          priceEl.className = "mono text-xl font-extrabold text-emerald-400 transition-colors duration-150";
+        } else if (newPrice < lastLivePrice) {
+          priceEl.className = "mono text-xl font-extrabold text-rose-400 transition-colors duration-150";
+        }
+      }
+      lastLivePrice = newPrice;
+      priceEl.textContent = `$${Number(newPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+      if (appState?.signals_by_horizon?.[currentHorizon]?.[currentSymbol]) {
+        appState.signals_by_horizon[currentHorizon][currentSymbol].latest_price = newPrice;
+      }
+    }
+
+    function renderAll() {
+      if (!appState) return;
+      const horizonsPerf = appState.isolated_performance?.horizons || {};
+      const rollup = appState.isolated_performance?.portfolio_Rollup || {};
+      const hPerf = horizonsPerf[currentHorizon] || {};
+      const sig = appState.signals_by_horizon?.[currentHorizon]?.[currentSymbol] || {};
+      const comp = sig.component_scores || {};
+      const rp = sig.risk_plan || {};
+      const reports = sig.agent_reports || {};
+      const patRep = reports.pattern || {};
+      const mlRep = reports.ml_shap || {};
+      const debRep = reports.debate || {};
+      const llmRev = debRep.llm_executive_review || {};
+      const shapFeatures = mlRep.shap_top_features_json || {};
+      const activeTrades = appState.active_trades_by_horizon?.[currentHorizon] || [];
+
+      // 1. Horizon Tabs
+      document.getElementById("horizonTabs").innerHTML = ["scalp", "intraday", "swing"].map(hKey => {
+        const meta = HORIZON_META[hKey];
+        const st = horizonsPerf[hKey] || {};
+        const g = Number(st.growth_rate_pct || 0);
+        const activeClass = currentHorizon === hKey ? `border-2 ${meta.border} bg-slate-900/95 shadow-xl` : "glass opacity-75 hover:opacity-100";
+        return `
+          <button onclick="selectHorizon('${hKey}')" class="text-left p-4 rounded-2xl transition-all ${activeClass}">
+            <div class="flex items-center justify-between">
+              <span class="font-extrabold text-sm text-white">${meta.label}</span>
+              <span class="mono text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300">${meta.badge}</span>
+            </div>
+            <p class="text-xs text-slate-400 mt-1">${meta.sub}</p>
+            <div class="mt-3 pt-3 border-t border-slate-800 flex items-center justify-between mono text-xs">
+              <span>Equity: <strong class="text-white">$${Number(st.current_equity_usdt || 1000).toLocaleString()}</strong></span>
+              <span>Growth: <strong class="${g >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${g >= 0 ? '+' : ''}${g}%</strong></span>
+              <span>WinRate: <strong class="text-cyan-300">${st.win_rate_pct || 0}%</strong></span>
+            </div>
+          </button>
+        `;
+      }).join("");
+
+      // 2. KPI Grid
+      const gPct = Number(hPerf.growth_rate_pct || 0);
+      const netPnl = Number(hPerf.net_pnl_usdt || 0);
+      document.getElementById("kpiGrid").innerHTML = `
+        <div class="glass p-4 rounded-xl">
+          <p class="text-[11px] uppercase text-slate-400 font-semibold">${currentHorizon.toUpperCase()} Isolated Equity</p>
+          <p class="mono text-xl font-extrabold text-white mt-1">$${Number(hPerf.current_equity_usdt || 1000).toLocaleString()}</p>
+          <p class="text-[11px] text-slate-500 mt-0.5">Initial Capital: $1,000.00</p>
+        </div>
+        <div class="glass p-4 rounded-xl">
+          <p class="text-[11px] uppercase text-slate-400 font-semibold">Account Growth Rate</p>
+          <p class="mono text-xl font-extrabold mt-1 ${gPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${gPct >= 0 ? '+' : ''}${gPct}%</p>
+          <p class="text-[11px] text-slate-500 mt-0.5">Isolated ${currentHorizon} ROI</p>
+        </div>
+        <div class="glass p-4 rounded-xl">
+          <p class="text-[11px] uppercase text-slate-400 font-semibold">Net Realized PnL</p>
+          <p class="mono text-xl font-extrabold mt-1 ${netPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">$${netPnl.toFixed(2)} (${Number(hPerf.net_realized_r || 0).toFixed(2)}R)</p>
+          <p class="text-[11px] text-slate-500 mt-0.5">Segregated Ledger</p>
+        </div>
+        <div class="glass p-4 rounded-xl">
+          <p class="text-[11px] uppercase text-slate-400 font-semibold">Win Rate & Trades</p>
+          <p class="mono text-xl font-extrabold text-cyan-400 mt-1">${hPerf.win_rate_pct || 0}%</p>
+          <p class="text-[11px] text-slate-500 mt-0.5">${hPerf.closed_trades_count || 0} Closed • ${hPerf.active_trades_count || 0} Active</p>
+        </div>
+        <div class="glass p-4 rounded-xl">
+          <p class="text-[11px] uppercase text-slate-400 font-semibold">Profit Factor / DD</p>
+          <p class="mono text-xl font-extrabold text-amber-300 mt-1">PF ${hPerf.profit_factor || 0}</p>
+          <p class="text-[11px] text-slate-500 mt-0.5">Max DD: ${hPerf.max_drawdown_r || 0}R</p>
+        </div>
+        <div class="glass p-4 rounded-xl border-indigo-500/30">
+          <p class="text-[11px] uppercase text-indigo-300 font-semibold">Combined 3-Book Equity</p>
+          <p class="mono text-xl font-extrabold text-white mt-1">$${Number(rollup.total_current_equity_usdt || 3000).toLocaleString()}</p>
+          <p class="text-[11px] text-indigo-400 mt-0.5">Total Growth: ${rollup.portfolio_growth_rate_pct || 0}%</p>
+        </div>
+      `;
+
+      // 3. Symbol & Header Badges
+      const syms = appState.symbols_scanned || ["BTCUSDT"];
+      document.getElementById("symbolBtns").innerHTML = syms.map(s => `
+        <button onclick="selectSymbol('${s}')" class="px-3.5 py-1.5 rounded-xl mono text-xs font-bold ${currentSymbol === s ? 'bg-emerald-500 text-slate-950' : 'bg-slate-900 text-slate-400 border border-slate-800'}">${s}</button>
+      `).join("");
+      document.getElementById("latestPrice").textContent = `$${Number(sig.latest_price || 0).toLocaleString()}`;
+      document.getElementById("tfBadge").textContent = `TF: ${sig.timeframe || '5m'} (HTF: ${sig.htf_timeframe || '1h'})`;
+
+      const bias = sig.evaluated_bias || sig.direction || "LONG";
+      const biasEl = document.getElementById("biasBadge");
+      biasEl.textContent = bias === "LONG" ? "🟢 BULLISH BIAS" : "🔴 BEARISH BIAS";
+      biasEl.className = `px-3 py-1 rounded-lg mono text-xs font-extrabold ${bias === 'LONG' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-400 border border-rose-500/40'}`;
+      document.getElementById("tierBadge").textContent = `Tier: ${sig.signal_tier || 'NO_TRADE'}`;
+
+      // 4. Execution Plan Cards
+      document.getElementById("vipLockOverlay").classList.toggle("hidden", isVip);
+      const rpGrid = document.getElementById("riskPlanGrid");
+      rpGrid.className = `grid grid-cols-2 sm:grid-cols-4 gap-3 ${!isVip ? 'vip-blur' : ''}`;
+      rpGrid.innerHTML = `
+        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-sky-500/30">
+          <span class="text-[11px] text-sky-400 font-bold uppercase">Optimal Entry</span>
+          <p class="mono text-base font-extrabold text-white mt-1">$${Number(rp.entry_price || sig.latest_price || 0).toLocaleString()}</p>
+          <span class="text-[11px] text-slate-400 mono">ATR: $${Number(rp.atr_value || 0).toFixed(2)}</span>
+        </div>
+        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-rose-500/30">
+          <span class="text-[11px] text-rose-400 font-bold uppercase">ATR Stop-Loss</span>
+          <p class="mono text-base font-extrabold text-rose-400 mt-1">$${Number(rp.stop_loss || 0).toLocaleString()}</p>
+          <span class="text-[11px] text-slate-400 mono">${rp.sl_atr_mult || 1.5}x ATR Barrier</span>
+        </div>
+        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-amber-500/30">
+          <span class="text-[11px] text-amber-300 font-bold uppercase">TP1 (50% + BE)</span>
+          <p class="mono text-base font-extrabold text-amber-300 mt-1">$${Number(rp.tp1_price || 0).toLocaleString()}</p>
+          <span class="text-[11px] text-slate-400 mono">R:R 1:${rp.rr_ratio_tp1 || 1.2}</span>
+        </div>
+        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-emerald-500/30">
+          <span class="text-[11px] text-emerald-400 font-bold uppercase">TP2 (Full Runner)</span>
+          <p class="mono text-base font-extrabold text-emerald-400 mt-1">$${Number(rp.tp2_price || 0).toLocaleString()}</p>
+          <span class="text-[11px] text-slate-400 mono">R:R 1:${rp.rr_ratio_tp2 || 2.0}</span>
+        </div>
+      `;
+
+      // 5. Render Candlestick Chart
+      renderChart(sig.chart_candles || [], rp);
+      updateCalculator();
+
+      // 6. 100-Pt Confluence Breakdown
+      document.getElementById("totalScore").textContent = Number(sig.total_confluence_score || 0).toFixed(1);
+      const bars = [
+        { label: "1. XGBoost + TreeSHAP ML (Max 45)", val: Number(comp.ml_shap_score_45 || 0), max: 45, color: "bg-emerald-500", text: "text-emerald-400" },
+        { label: "2. Market Structure & Regime (Max 25)", val: Number(comp.pattern_structure_score_25 || 0), max: 25, color: "bg-cyan-400", text: "text-cyan-400" },
+        { label: "3. Orderbook & Funding Sentiment (Max 15)", val: Number(comp.sentiment_microstructure_score_15 || 0), max: 15, color: "bg-amber-400", text: "text-amber-300" },
+        { label: "4. Bull/Bear Debate & Memory (Max 15)", val: Number(comp.debate_memory_score_15 || 0), max: 15, color: "bg-purple-500", text: "text-purple-400" }
+      ];
+      document.getElementById("scoreBars").innerHTML = bars.map(b => `
+        <div>
+          <div class="flex justify-between mb-1">
+            <span class="text-slate-300 font-medium">${b.label}</span>
+            <span class="mono font-bold ${b.text}">${b.val.toFixed(1)} / ${b.max}</span>
+          </div>
+          <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+            <div class="h-full ${b.color}" style="width: ${Math.min(100, (b.val / b.max) * 100)}%"></div>
+          </div>
+        </div>
+      `).join("");
+
+      document.getElementById("regimeChips").innerHTML = `
+        <span class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">Regime: <strong class="text-white">${patRep.market_regime || 'N/A'}</strong></span>
+        <span class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">Pattern: <strong class="text-cyan-300">${patRep.pattern_type || 'N/A'}</strong></span>
+        <span class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">ML Win Prob: <strong class="text-emerald-400">${((mlRep.win_probability || 0.5) * 100).toFixed(1)}%</strong></span>
+      `;
+
+      // 7. SHAP Drivers
+      const shapEl = document.getElementById("shapList");
+      shapEl.className = !isVip ? "vip-blur space-y-2" : "space-y-2";
+      shapEl.innerHTML = Object.entries(shapFeatures).slice(0, 5).map(([k, v]) => {
+        const num = Number(v);
+        return `
+          <div class="flex items-center justify-between bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800 text-xs">
+            <span class="mono text-slate-300">${k}</span>
+            <span class="mono font-bold ${num >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${num >= 0 ? '+' + num.toFixed(4) + ' (Bullish)' : num.toFixed(4) + ' (Bearish)'}</span>
+          </div>
+        `;
+      }).join("");
+
+      // 8. Debate Box
+      const debEl = document.getElementById("debateBox");
+      debEl.className = !isVip ? "vip-blur space-y-2.5 text-xs" : "space-y-2.5 text-xs";
+      debEl.innerHTML = `
+        <div class="p-3 rounded-xl bg-emerald-950/30 border border-emerald-500/30">
+          <span class="font-bold text-emerald-400 block mb-0.5">🐂 Bull Researcher Thesis:</span>
+          <p class="text-slate-300">${llmRev.bull_thesis || debRep.bull_arguments?.[0] || 'Structure and momentum support upside continuation.'}</p>
+        </div>
+        <div class="p-3 rounded-xl bg-rose-950/30 border border-rose-500/30">
+          <span class="font-bold text-rose-400 block mb-0.5">🐻 Bear Researcher Thesis:</span>
+          <p class="text-slate-300">${llmRev.bear_thesis || debRep.bear_arguments?.[0] || 'Monitor higher-timeframe resistance and volatility spikes.'}</p>
+        </div>
+        <div class="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/40">
+          <span class="font-bold text-indigo-300 block mb-0.5">👨‍⚖️ Executive Judge Synthesis:</span>
+          <p class="text-slate-200 italic">"${llmRev.judge_synthesis || 'Quantitative confluence and episodic memory verified.'}"</p>
+        </div>
+      `;
+
+      // 9. Active Trades Ledger
+      document.getElementById("ledgerTitle").textContent = `📡 ${currentHorizon.toUpperCase()} Active Trade Lifecycle Monitor (OPEN & TP1 Breakeven Runners)`;
+      document.getElementById("ledgerDbPath").innerHTML = `Isolated Database: <code class="mono text-emerald-400">data/databases/${currentHorizon}_trading.db</code>`;
+      document.getElementById("activeCountBadge").textContent = `Active Positions: ${activeTrades.length}`;
+
+      if (activeTrades.length === 0) {
+        document.getElementById("activeTradesContainer").innerHTML = `
+          <div class="text-center py-6 text-xs text-slate-400 bg-slate-900/50 rounded-xl border border-slate-800">
+            No active open positions in the <strong>${currentHorizon.toUpperCase()}</strong> book right now. Click <strong class="text-emerald-400">"⚡ Dispatch Demo Signal + Telegram"</strong> above to test live execution & Telegram alerting!
+          </div>
+        `;
+      } else {
+        document.getElementById("activeTradesContainer").innerHTML = `
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse text-xs mono">
+              <thead>
+                <tr class="border-b border-slate-800 text-slate-400 uppercase">
+                  <th class="py-2 px-3">ID</th><th class="py-2 px-3">Symbol</th><th class="py-2 px-3">Side</th><th class="py-2 px-3">Status</th>
+                  <th class="py-2 px-3">Entry</th><th class="py-2 px-3">Stop-Loss</th><th class="py-2 px-3">TP1 (BE)</th><th class="py-2 px-3">TP2</th><th class="py-2 px-3">Score</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-800/60">
+                ${activeTrades.map(t => `
+                  <tr class="hover:bg-slate-900/60">
+                    <td class="py-2.5 px-3 font-bold text-slate-300">#${t.trade_id}</td>
+                    <td class="py-2.5 px-3 font-bold text-white">${t.symbol}</td>
+                    <td class="py-2.5 px-3 font-bold ${t.direction === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}">${t.direction}</td>
+                    <td class="py-2.5 px-3"><span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">${t.status}</span></td>
+                    <td class="py-2.5 px-3">$${Number(t.entry_price).toLocaleString()}</td>
+                    <td class="py-2.5 px-3 text-rose-400">$${Number(t.stop_loss).toLocaleString()}</td>
+                    <td class="py-2.5 px-3 text-amber-300">$${Number(t.tp1_price).toLocaleString()}</td>
+                    <td class="py-2.5 px-3 text-emerald-400">$${Number(t.tp2_price).toLocaleString()}</td>
+                    <td class="py-2.5 px-3 text-cyan-300">${Number(t.confluence_score).toFixed(1)}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+    }
+
+    function updateCalculator() {
+      if (!appState) return;
+      const sig = appState.signals_by_horizon?.[currentHorizon]?.[currentSymbol] || {};
+      const rp = sig.risk_plan || {};
+      const bal = Number(document.getElementById("calcBalance").value || 1000);
+      const riskPct = Number(document.getElementById("calcRisk").value || 1.0);
+      const entryP = Number(rp.entry_price || sig.latest_price || 90000);
+      const stopP = Number(rp.stop_loss || entryP * 0.99);
+      const dist = Math.max(Math.abs(entryP - stopP), 0.0001);
+      const riskUsdt = bal * (riskPct / 100.0);
+      const coins = riskUsdt / dist;
+      document.getElementById("calcRiskUsdt").textContent = `$${riskUsdt.toFixed(2)} USDT`;
+      document.getElementById("calcOrderSize").textContent = `${coins.toFixed(5)} ${currentSymbol.replace("USDT", "")}`;
+    }
+
+    function renderChart(candles, rp) {
+      const container = document.getElementById("tvChart");
+      if (!container || !window.LightweightCharts || !candles.length) return;
+      container.innerHTML = "";
+
+      tvChartInstance = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: 380,
+        layout: { background: { type: "solid", color: "#0B0F17" }, textColor: "#94A3B8", fontFamily: "JetBrains Mono" },
+        grid: { vertLines: { color: "rgba(30, 41, 59, 0.45)" }, horzLines: { color: "rgba(30, 41, 59, 0.45)" } },
+        rightPriceScale: { borderColor: "#1E293B" },
+        timeScale: { borderColor: "#1E293B", timeVisible: true, secondsVisible: false }
+      });
+
+      tvCandleSeries = tvChartInstance.addCandlestickSeries({
+        upColor: "#10B981", downColor: "#EF4444", borderUpColor: "#10B981", borderDownColor: "#EF4444", wickUpColor: "#10B981", wickDownColor: "#EF4444"
+      });
+
+      const sorted = [...candles].sort((a, b) => a.time - b.time);
+      const unique = [];
+      const seen = new Set();
+      for (const c of sorted) {
+        if (!seen.has(c.time)) { seen.add(c.time); unique.push(c); }
+      }
+      tvCandleSeries.setData(unique);
+
+      if (isVip && rp && rp.entry_price) {
+        tvCandleSeries.createPriceLine({ price: Number(rp.entry_price), color: "#38BDF8", lineWidth: 2, title: "ENTRY" });
+        tvCandleSeries.createPriceLine({ price: Number(rp.stop_loss), color: "#F43F5E", lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: "STOP LOSS" });
+        tvCandleSeries.createPriceLine({ price: Number(rp.tp1_price), color: "#FACC15", lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, title: "TP1 (50% + BE)" });
+        tvCandleSeries.createPriceLine({ price: Number(rp.tp2_price), color: "#10B981", lineWidth: 2, title: "TP2 (RUNNER)" });
+      }
+      tvChartInstance.timeScale().fitContent();
+    }
+
+    window.addEventListener("DOMContentLoaded", () => loadState(false));
+  </script>
+</body>
+</html>
