@@ -1,9 +1,35 @@
+
+# Python
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+pytest-of-*/
+
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+
+# Local databases
 data/databases/*.db
+data/databases/*.db-*
+data/databases/*.sqlite
+data/databases/*.sqlite3
+
+# Cached market data
+data/cache/
+
+# Trained ML models
 models/**/*.pkl
-models/**/*.json.pytest_cache/
-data/cache/*.parquet
 models/**/*.joblib
+
+# Frontend dependencies and builds
+node_modules/
+dist/
+
+# Logs and temporary files
+*.log
+.DS_Store
+Thumbs.db
