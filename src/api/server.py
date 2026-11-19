@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -40,11 +40,28 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets", check_dir=False), name="frontend-assets")
 
 
+
 class RiskCalcRequest(BaseModel):
-    account_balance_usdt: float = 1000.0
-    risk_pct: float = 1.0
-    entry_price: float
-    stop_loss: float
+    account_balance_usdt: float = Field(
+        default=1000.0,
+        gt=0,
+        allow_inf_nan=False
+    )
+    risk_pct: float = Field(
+        default=1.0,
+        gt=0,
+        le=100,
+        allow_inf_nan=False
+    )
+    entry_price: float = Field(
+        gt=0,
+        allow_inf_nan=False
+    )
+    stop_loss: float = Field(
+        gt=0,
+        allow_inf_nan=False
+    )
+
 
 
 def _resolve_horizon_db_path(horizon: str) -> Path:
